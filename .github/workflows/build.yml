@@ -1,0 +1,2157 @@
+name: Build ClientUtils v4 (Fabric 1.21.11)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.2.1
+
+      - name: Resolve Fabric versions and write project files
+        run: |
+          set -e
+          MC=1.21.11
+          YARN=$(curl -s https://meta.fabricmc.net/v2/versions/yarn/$MC | jq -r '.[0].version')
+          LOADER=$(curl -s https://meta.fabricmc.net/v2/versions/loader | jq -r '[.[] | select(.stable==true)][0].version')
+          API=$(curl -s https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/maven-metadata.xml | grep -o "<version>[^<]*+$MC</version>" | sed 's/<[^>]*>//g' | tail -1)
+          echo "MC=$MC YARN=$YARN LOADER=$LOADER API=$API"
+          if [ -z "$YARN" ] || [ -z "$LOADER" ] || [ -z "$API" ]; then echo "Gagal mengambil versi Fabric"; exit 1; fi
+
+          mkdir -p mod && cd mod
+          mkdir -p src/main/java/com/example/clientutils/mixin
+          mkdir -p src/main/resources/assets/clientutils/lang
+
+          cat > gradle.properties <<EOF
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+          minecraft_version=$MC
+          yarn_mappings=$YARN
+          loader_version=$LOADER
+          fabric_version=$API
+          mod_version=4.0.0
+          maven_group=com.example
+          archives_base_name=clientutils
+          EOF
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  maven { name = 'Fabric'; url = 'https://maven.fabricmc.net/' }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          rootProject.name = 'clientutils'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'fabric-loom' version '1.14-SNAPSHOT'
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+              modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": inputs.properties.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 21
+              it.options.encoding = 'UTF-8'
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_21
+              targetCompatibility = JavaVersion.VERSION_21
+          }
+          EOF
+
+          cat > src/main/resources/fabric.mod.json <<'EOF'
+          {
+            "schemaVersion": 1,
+            "id": "clientutils",
+            "version": "${version}",
+            "name": "Client Utils",
+            "description": "Client mod: mod menu UI, waypoints, swappers, zoom, freecam, freelook, view model, crosshair, keystrokes and more.",
+            "authors": ["You"],
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["com.example.clientutils.ClientUtilsMod"]
+            },
+            "mixins": ["clientutils.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.16.0",
+              "minecraft": "~1.21.11",
+              "java": ">=21",
+              "fabric-api": "*"
+            }
+          }
+          EOF
+
+          cat > src/main/resources/clientutils.mixins.json <<'EOF'
+          {
+            "required": false,
+            "minVersion": "0.8",
+            "package": "com.example.clientutils.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "client": [
+              "EntityMixin",
+              "CameraMixin",
+              "GameRendererMixin",
+              "HeldItemRendererMixin"
+            ],
+            "injectors": {
+              "defaultRequire": 0
+            }
+          }
+          EOF
+
+          cat > src/main/resources/assets/clientutils/lang/en_us.json <<'EOF'
+          {
+            "key.category.clientutils.main": "Client Utils",
+            "key.clientutils.open": "Open Mod Menu",
+            "key.clientutils.elytra": "Elytra Swapper",
+            "key.clientutils.spear": "Spear Lunge Swapper",
+            "key.clientutils.tnt": "Rail + TNT Cart",
+            "key.clientutils.freelook": "Freelook (hold)",
+            "key.clientutils.zoom": "Zoom (hold)",
+            "key.clientutils.obscrystal": "Obsidian + Crystal",
+            "key.clientutils.anchor": "Anchor + Glowstone",
+            "key.clientutils.freecam": "Freecam (toggle)"
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/mixin/EntityMixin.java <<'EOF'
+          package com.example.clientutils.mixin;
+
+          import com.example.clientutils.Freecam;
+          import com.example.clientutils.Freelook;
+          import net.minecraft.client.network.ClientPlayerEntity;
+          import net.minecraft.entity.Entity;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          @Mixin(Entity.class)
+          public abstract class EntityMixin {
+              @Inject(method = "changeLookDirection", at = @At("HEAD"), cancellable = true, require = 0)
+              private void clientutils$turn(double dx, double dy, CallbackInfo ci) {
+                  if ((Freecam.active || Freelook.active) && (Object) this instanceof ClientPlayerEntity) {
+                      if (Freecam.active) Freecam.turn(dx, dy);
+                      else Freelook.turn(dx, dy);
+                      ci.cancel();
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/mixin/CameraMixin.java <<'EOF'
+          package com.example.clientutils.mixin;
+
+          import com.example.clientutils.Freecam;
+          import com.example.clientutils.Freelook;
+          import net.minecraft.client.render.Camera;
+          import net.minecraft.util.math.Vec3d;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.ModifyVariable;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          @Mixin(Camera.class)
+          public abstract class CameraMixin {
+              @Inject(method = "update", at = @At("HEAD"), require = 0)
+              private void clientutils$frame(CallbackInfo ci) {
+                  Freecam.frame();
+              }
+
+              @ModifyVariable(method = "setRotation", at = @At("HEAD"), argsOnly = true, ordinal = 0, require = 0)
+              private float clientutils$yaw(float yaw) {
+                  if (Freecam.active) return Freecam.yaw;
+                  return Freelook.active ? Freelook.yaw : yaw;
+              }
+
+              @ModifyVariable(method = "setRotation", at = @At("HEAD"), argsOnly = true, ordinal = 1, require = 0)
+              private float clientutils$pitch(float pitch) {
+                  if (Freecam.active) return Freecam.pitch;
+                  return Freelook.active ? Freelook.pitch : pitch;
+              }
+
+              @ModifyVariable(method = "setPos(DDD)V", at = @At("HEAD"), argsOnly = true, ordinal = 0, require = 0)
+              private double clientutils$x(double x) {
+                  return Freecam.active ? Freecam.x : x;
+              }
+
+              @ModifyVariable(method = "setPos(DDD)V", at = @At("HEAD"), argsOnly = true, ordinal = 1, require = 0)
+              private double clientutils$y(double y) {
+                  return Freecam.active ? Freecam.y : y;
+              }
+
+              @ModifyVariable(method = "setPos(DDD)V", at = @At("HEAD"), argsOnly = true, ordinal = 2, require = 0)
+              private double clientutils$z(double z) {
+                  return Freecam.active ? Freecam.z : z;
+              }
+
+              @ModifyVariable(method = "setPos(Lnet/minecraft/util/math/Vec3d;)V", at = @At("HEAD"), argsOnly = true, require = 0)
+              private Vec3d clientutils$vec(Vec3d v) {
+                  return Freecam.active ? new Vec3d(Freecam.x, Freecam.y, Freecam.z) : v;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/mixin/GameRendererMixin.java <<'EOF'
+          package com.example.clientutils.mixin;
+
+          import com.example.clientutils.Zoom;
+          import net.minecraft.client.render.GameRenderer;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
+
+          @Mixin(GameRenderer.class)
+          public abstract class GameRendererMixin {
+              // Tipe return (float/double) dipertahankan lewat pengecekan runtime
+              @Inject(method = "getFov", at = @At("RETURN"), cancellable = true, require = 0)
+              private void clientutils$zoom(CallbackInfoReturnable<Object> cir) {
+                  float z = Zoom.factor();
+                  if (z <= 1.001f) return;
+                  Object r = cir.getReturnValue();
+                  if (r instanceof Float f) cir.setReturnValue(f / z);
+                  else if (r instanceof Double d) cir.setReturnValue(d / z);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/mixin/HeldItemRendererMixin.java <<'EOF'
+          package com.example.clientutils.mixin;
+
+          import com.example.clientutils.Config;
+          import net.minecraft.client.util.math.MatrixStack;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.ModifyVariable;
+
+          @Mixin(targets = "net.minecraft.client.render.item.HeldItemRenderer")
+          public abstract class HeldItemRendererMixin {
+              // Mengubah posisi dan ukuran item/tangan di first person (View Model)
+              @ModifyVariable(method = "renderFirstPersonItem", at = @At("HEAD"), argsOnly = true, require = 0)
+              private MatrixStack clientutils$viewModel(MatrixStack m) {
+                  Config c = Config.get();
+                  if (c.viewModel) {
+                      m.translate(c.vmX, c.vmY, c.vmZ);
+                      m.scale(c.vmScale, c.vmScale, c.vmScale);
+                  }
+                  return m;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/Config.java <<'EOF'
+          package com.example.clientutils;
+
+          import com.google.gson.Gson;
+          import com.google.gson.GsonBuilder;
+          import net.fabricmc.loader.api.FabricLoader;
+
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class Config {
+              public static class Waypoint {
+                  public String name = "Waypoint";
+                  /** Kategori = dimensi: minecraft:overworld, minecraft:the_nether, minecraft:the_end */
+                  public String dim = "minecraft:overworld";
+                  public int x, y, z;
+                  public int color = 0x55FF55;
+              }
+
+              public boolean healthIndicator = true;
+              public boolean waypoints = true;
+              public boolean waypointArrow = false;
+              public boolean waypointList = true;
+              public boolean waypointDistance = true;
+              public boolean coordinates = false;
+
+              public boolean elytraSwapper = true;
+              public boolean spearSwapper = true;
+
+              public boolean crosshair = true;
+              public int crosshairStyle = 3;
+              public int crosshairSize = 1;
+              public int crosshairColor = 0xFFFFFF;
+              public int crosshairTargetColor = 0xFF0000;
+
+              public boolean keystrokes = true;
+              public boolean keystrokesMouse = true;
+              public boolean keystrokesSpace = true;
+              public boolean fps = true;
+              public boolean cps = true;
+
+              public boolean freelook = true;
+              public boolean fullbright = false;
+              public boolean tntCart = true;
+              public boolean autoTotem = false;
+
+              // fitur baru
+              public boolean zoom = true;
+              public float zoomFactor = 4f;
+              public boolean zoomSmooth = true;
+              public boolean obsCrystal = true;
+              public boolean anchorGlow = true;
+              public boolean freecam = true;
+              public float freecamSpeed = 12f;
+              public boolean viewModel = false;
+              public float vmX = 0f, vmY = 0f, vmZ = 0f, vmScale = 1f;
+
+              public List<Waypoint> list = new ArrayList<>();
+
+              private static Config INSTANCE = new Config();
+              private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
+
+              private static Path path() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("clientutils.json");
+              }
+
+              public static Config get() {
+                  return INSTANCE;
+              }
+
+              public static void load() {
+                  try {
+                      Path p = path();
+                      if (Files.exists(p)) {
+                          Config c = GSON.fromJson(Files.readString(p), Config.class);
+                          if (c != null) {
+                              if (c.list == null) c.list = new ArrayList<>();
+                              INSTANCE = c;
+                          }
+                      }
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+              }
+
+              public static void save() {
+                  try {
+                      Files.writeString(path(), GSON.toJson(INSTANCE));
+                  } catch (Exception e) {
+                      e.printStackTrace();
+                  }
+              }
+
+              public static void resetFeatures() {
+                  Config n = new Config();
+                  n.list = INSTANCE.list;
+                  INSTANCE = n;
+                  save();
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/ClientUtilsMod.java <<'EOF'
+          package com.example.clientutils;
+
+          import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.fabricmc.fabric.api.client.rendering.v1.hud.HudElementRegistry;
+          import net.fabricmc.fabric.api.client.rendering.v1.hud.VanillaHudElements;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.util.Identifier;
+          import org.lwjgl.glfw.GLFW;
+
+          public class ClientUtilsMod implements ClientModInitializer {
+              public static KeyBinding openKey, elytraKey, spearKey, tntKey, freelookKey,
+                      zoomKey, obsKey, anchorKey, freecamKey;
+
+              private static KeyBinding reg(String id, int key, KeyBinding.Category cat) {
+                  return KeyBindingHelper.registerKeyBinding(
+                          new KeyBinding("key.clientutils." + id, InputUtil.Type.KEYSYM, key, cat));
+              }
+
+              @Override
+              public void onInitializeClient() {
+                  Config.load();
+
+                  KeyBinding.Category cat = KeyBinding.Category.create(Identifier.of("clientutils", "main"));
+                  openKey = reg("open", GLFW.GLFW_KEY_U, cat);
+                  elytraKey = reg("elytra", GLFW.GLFW_KEY_R, cat);
+                  spearKey = reg("spear", GLFW.GLFW_KEY_F, cat);
+                  tntKey = reg("tnt", GLFW.GLFW_KEY_K, cat);
+                  freelookKey = reg("freelook", GLFW.GLFW_KEY_LEFT_ALT, cat);
+                  zoomKey = reg("zoom", GLFW.GLFW_KEY_Z, cat);
+                  obsKey = reg("obscrystal", GLFW.GLFW_KEY_F10, cat);
+                  anchorKey = reg("anchor", GLFW.GLFW_KEY_F9, cat);
+                  freecamKey = reg("freecam", GLFW.GLFW_KEY_J, cat);
+
+                  ClientTickEvents.START_CLIENT_TICK.register(Freecam::tickStart);
+
+                  ClientTickEvents.END_CLIENT_TICK.register(mc -> {
+                      Swappers.tick(mc);
+                      Freelook.tick(mc);
+                      Extras.tick(mc);
+                      Freecam.tickEnd(mc);
+                      if (mc.player == null || mc.world == null) return;
+
+                      Config cfg = Config.get();
+                      while (openKey.wasPressed()) {
+                          if (mc.currentScreen == null) mc.setScreen(new ModMenuScreen(0));
+                      }
+                      while (elytraKey.wasPressed()) {
+                          if (mc.currentScreen == null && cfg.elytraSwapper) Swappers.elytra(mc);
+                      }
+                      while (spearKey.wasPressed()) {
+                          if (mc.currentScreen == null && cfg.spearSwapper) Swappers.spear(mc);
+                      }
+                      while (tntKey.wasPressed()) {
+                          if (mc.currentScreen == null && cfg.tntCart) Swappers.tntCart(mc);
+                      }
+                      while (obsKey.wasPressed()) {
+                          if (mc.currentScreen == null && cfg.obsCrystal) Swappers.obsidianCrystal(mc);
+                      }
+                      while (anchorKey.wasPressed()) {
+                          if (mc.currentScreen == null && cfg.anchorGlow) Swappers.anchorGlow(mc);
+                      }
+                      while (freecamKey.wasPressed()) {
+                          if (mc.currentScreen == null && cfg.freecam) Freecam.toggle(mc);
+                      }
+                  });
+
+                  HudElementRegistry.addLast(Identifier.of("clientutils", "hud"), Hud::render);
+
+                  HudElementRegistry.replaceElement(VanillaHudElements.CROSSHAIR, original -> (ctx, tick) -> {
+                      MinecraftClient mc = MinecraftClient.getInstance();
+                      if (Config.get().crosshair && mc.options.getPerspective().isFirstPerson()) {
+                          Crosshair.renderHud(ctx, mc);
+                      } else {
+                          original.render(ctx, tick);
+                      }
+                  });
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/Zoom.java <<'EOF'
+          package com.example.clientutils;
+
+          import net.minecraft.client.MinecraftClient;
+
+          public class Zoom {
+              private static float cur = 1f;
+              private static long last = 0;
+
+              /** Pengali zoom saat ini (1 = tidak zoom). Dipanggil dari mixin FOV setiap frame. */
+              public static float factor() {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  Config c = Config.get();
+                  long now = System.nanoTime();
+                  double dt = last == 0 ? 0.016 : Math.min(0.1, (now - last) / 1e9);
+                  last = now;
+
+                  boolean on = c.zoom && mc.currentScreen == null
+                          && ClientUtilsMod.zoomKey != null && ClientUtilsMod.zoomKey.isPressed();
+                  float target = on ? Math.max(1f, c.zoomFactor) : 1f;
+                  if (c.zoomSmooth) cur += (target - cur) * (float) Math.min(1.0, dt * 12.0);
+                  else cur = target;
+                  if (Math.abs(cur - target) < 0.005f) cur = target;
+                  return cur;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/Freelook.java <<'EOF'
+          package com.example.clientutils;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.option.Perspective;
+
+          public class Freelook {
+              public static boolean active;
+              public static float yaw, pitch;
+              private static Perspective prev;
+
+              public static void tick(MinecraftClient mc) {
+                  boolean want = Config.get().freelook
+                          && !Freecam.active
+                          && mc.player != null
+                          && mc.currentScreen == null
+                          && ClientUtilsMod.freelookKey != null
+                          && ClientUtilsMod.freelookKey.isPressed();
+
+                  if (want && !active) {
+                      active = true;
+                      yaw = mc.player.getYaw();
+                      pitch = mc.player.getPitch();
+                      prev = mc.options.getPerspective();
+                      mc.options.setPerspective(Perspective.THIRD_PERSON_BACK);
+                  } else if (!want && active) {
+                      active = false;
+                      if (prev != null) mc.options.setPerspective(prev);
+                      prev = null;
+                  }
+              }
+
+              public static void turn(double dx, double dy) {
+                  yaw += (float) dx * 0.15f;
+                  pitch += (float) dy * 0.15f;
+                  if (pitch > 90f) pitch = 90f;
+                  if (pitch < -90f) pitch = -90f;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/Freecam.java <<'EOF'
+          package com.example.clientutils;
+
+          import net.fabricmc.fabric.api.client.keybinding.v1.KeyBindingHelper;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.option.Perspective;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Hand;
+          import net.minecraft.util.hit.BlockHitResult;
+          import net.minecraft.util.hit.HitResult;
+          import net.minecraft.util.math.Vec3d;
+          import net.minecraft.world.RaycastContext;
+          import org.lwjgl.glfw.GLFW;
+
+          /**
+           * Freecam: kamera lepas dari pemain, bebas menembus blok. Pemain tetap diam di tempatnya.
+           * Klik kanan memasang blok dari arah bidik kamera (selama dalam jangkauan pemain).
+           */
+          public class Freecam {
+              public static boolean active;
+              public static double x, y, z;
+              public static float yaw, pitch;
+
+              private static long last;
+              private static Perspective prev;
+              private static boolean rcDown;
+              private static int cooldown;
+
+              public static void toggle(MinecraftClient mc) {
+                  if (active) stop(mc);
+                  else start(mc);
+              }
+
+              private static void start(MinecraftClient mc) {
+                  if (mc.player == null) return;
+                  Vec3d e = mc.player.getEyePos();
+                  x = e.x;
+                  y = e.y;
+                  z = e.z;
+                  yaw = mc.player.getYaw();
+                  pitch = mc.player.getPitch();
+                  prev = mc.options.getPerspective();
+                  mc.options.setPerspective(Perspective.FIRST_PERSON);
+                  last = 0;
+                  rcDown = false;
+                  active = true;
+                  mc.player.sendMessage(Text.literal("Freecam ON"), true);
+              }
+
+              public static void stop(MinecraftClient mc) {
+                  if (!active) return;
+                  active = false;
+                  if (prev != null) mc.options.setPerspective(prev);
+                  prev = null;
+                  if (mc.player != null) mc.player.sendMessage(Text.literal("Freecam OFF"), true);
+              }
+
+              public static void turn(double dx, double dy) {
+                  yaw += (float) dx * 0.15f;
+                  pitch += (float) dy * 0.15f;
+                  if (pitch > 90f) pitch = 90f;
+                  if (pitch < -90f) pitch = -90f;
+              }
+
+              private static boolean down(MinecraftClient mc, KeyBinding kb) {
+                  try {
+                      int code = KeyBindingHelper.getBoundKeyOf(kb).getCode();
+                      return code > 0 && GLFW.glfwGetKey(mc.getWindow().getHandle(), code) == GLFW.GLFW_PRESS;
+                  } catch (Throwable t) {
+                      return kb.isPressed();
+                  }
+              }
+
+              /** Dipanggil setiap frame dari mixin Camera.update. */
+              public static void frame() {
+                  if (!active) {
+                      last = 0;
+                      return;
+                  }
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  if (mc.player == null) {
+                      active = false;
+                      return;
+                  }
+                  long now = System.nanoTime();
+                  double dt = last == 0 ? 0.016 : Math.min(0.1, (now - last) / 1e9);
+                  last = now;
+                  if (mc.currentScreen != null) return;
+
+                  double yr = Math.toRadians(yaw), pr = Math.toRadians(pitch);
+                  double fx = -Math.sin(yr) * Math.cos(pr), fy = -Math.sin(pr), fz = Math.cos(yr) * Math.cos(pr);
+                  double rx = -Math.cos(yr), rz = -Math.sin(yr);
+
+                  var o = mc.options;
+                  double mx = 0, my = 0, mz = 0;
+                  if (down(mc, o.forwardKey)) {
+                      mx += fx;
+                      my += fy;
+                      mz += fz;
+                  }
+                  if (down(mc, o.backKey)) {
+                      mx -= fx;
+                      my -= fy;
+                      mz -= fz;
+                  }
+                  if (down(mc, o.rightKey)) {
+                      mx += rx;
+                      mz += rz;
+                  }
+                  if (down(mc, o.leftKey)) {
+                      mx -= rx;
+                      mz -= rz;
+                  }
+                  if (down(mc, o.jumpKey)) my += 1;
+                  if (down(mc, o.sneakKey)) my -= 1;
+
+                  double len = Math.sqrt(mx * mx + my * my + mz * mz);
+                  if (len > 0) {
+                      mx /= len;
+                      my /= len;
+                      mz /= len;
+                  }
+                  double sp = Config.get().freecamSpeed * (down(mc, o.sprintKey) ? 2.0 : 1.0) * dt;
+                  x += mx * sp;
+                  y += my * sp;
+                  z += mz * sp;
+              }
+
+              /** Awal tick: cegah pemain bergerak/menyerang/memakai item selagi freecam aktif. */
+              public static void tickStart(MinecraftClient mc) {
+                  if (!active || mc.player == null) return;
+                  var o = mc.options;
+                  o.forwardKey.setPressed(false);
+                  o.backKey.setPressed(false);
+                  o.leftKey.setPressed(false);
+                  o.rightKey.setPressed(false);
+                  o.jumpKey.setPressed(false);
+                  o.sneakKey.setPressed(false);
+                  o.sprintKey.setPressed(false);
+                  o.useKey.setPressed(false);
+                  o.attackKey.setPressed(false);
+                  while (o.useKey.wasPressed()) {
+                  }
+                  while (o.attackKey.wasPressed()) {
+                  }
+              }
+
+              public static void tickEnd(MinecraftClient mc) {
+                  if (!active) return;
+                  if (mc.player == null || mc.world == null) {
+                      active = false;
+                      return;
+                  }
+                  if (!Config.get().freecam) {
+                      stop(mc);
+                      return;
+                  }
+                  if (mc.currentScreen != null) return;
+
+                  boolean rc = GLFW.glfwGetMouseButton(mc.getWindow().getHandle(),
+                          GLFW.GLFW_MOUSE_BUTTON_RIGHT) == GLFW.GLFW_PRESS;
+                  if (cooldown > 0) cooldown--;
+                  if (rc && (!rcDown || cooldown == 0)) {
+                      place(mc);
+                      cooldown = 5;
+                  }
+                  rcDown = rc;
+              }
+
+              private static void place(MinecraftClient mc) {
+                  if (mc.interactionManager == null) return;
+                  double yr = Math.toRadians(yaw), pr = Math.toRadians(pitch);
+                  Vec3d start = new Vec3d(x, y, z);
+                  Vec3d dir = new Vec3d(-Math.sin(yr) * Math.cos(pr), -Math.sin(pr), Math.cos(yr) * Math.cos(pr));
+                  Vec3d end = start.add(dir.multiply(32.0));
+
+                  BlockHitResult hit = mc.world.raycast(new RaycastContext(start, end,
+                          RaycastContext.ShapeType.OUTLINE, RaycastContext.FluidHandling.NONE, mc.player));
+                  if (hit.getType() != HitResult.Type.BLOCK) return;
+
+                  if (mc.player.getEyePos().distanceTo(hit.getPos()) > 5.0) {
+                      mc.player.sendMessage(Text.literal("Terlalu jauh dari pemain (maks ~5 blok)"), true);
+                      return;
+                  }
+                  mc.interactionManager.interactBlock(mc.player, Hand.MAIN_HAND, hit);
+                  mc.player.swingHand(Hand.MAIN_HAND);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/Extras.java <<'EOF'
+          package com.example.clientutils;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.network.ClientPlayerEntity;
+          import net.minecraft.entity.effect.StatusEffectInstance;
+          import net.minecraft.entity.effect.StatusEffects;
+          import net.minecraft.item.Items;
+          import net.minecraft.screen.slot.SlotActionType;
+
+          public class Extras {
+              private static boolean fbApplied;
+              private static int totemCd;
+
+              public static void tick(MinecraftClient mc) {
+                  fullbright(mc);
+                  autoTotem(mc);
+              }
+
+              private static void fullbright(MinecraftClient mc) {
+                  ClientPlayerEntity p = mc.player;
+                  if (p == null) {
+                      fbApplied = false;
+                      return;
+                  }
+                  if (Config.get().fullbright) {
+                      if (p.getStatusEffect(StatusEffects.NIGHT_VISION) == null) {
+                          p.addStatusEffect(new StatusEffectInstance(
+                                  StatusEffects.NIGHT_VISION, StatusEffectInstance.INFINITE, 0, false, false, false));
+                          fbApplied = true;
+                      }
+                  } else if (fbApplied) {
+                      p.removeStatusEffect(StatusEffects.NIGHT_VISION);
+                      fbApplied = false;
+                  }
+              }
+
+              private static void autoTotem(MinecraftClient mc) {
+                  ClientPlayerEntity p = mc.player;
+                  if (!Config.get().autoTotem || p == null || mc.interactionManager == null
+                          || mc.currentScreen != null) return;
+                  if (totemCd > 0) {
+                      totemCd--;
+                      return;
+                  }
+                  if (p.getOffHandStack().isOf(Items.TOTEM_OF_UNDYING)) return;
+
+                  for (int i = 9; i <= 44; i++) {
+                      if (p.playerScreenHandler.getSlot(i).getStack().isOf(Items.TOTEM_OF_UNDYING)) {
+                          // SWAP dengan tombol 40 = offhand
+                          mc.interactionManager.clickSlot(p.playerScreenHandler.syncId, i, 40, SlotActionType.SWAP, p);
+                          totemCd = 4;
+                          return;
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/Swappers.java <<'EOF'
+          package com.example.clientutils;
+
+          import net.minecraft.block.BlockState;
+          import net.minecraft.block.Blocks;
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.network.ClientPlayerEntity;
+          import net.minecraft.client.option.KeyBinding;
+          import net.minecraft.client.util.InputUtil;
+          import net.minecraft.component.DataComponentTypes;
+          import net.minecraft.component.type.EquippableComponent;
+          import net.minecraft.enchantment.Enchantment;
+          import net.minecraft.entity.EquipmentSlot;
+          import net.minecraft.entity.player.PlayerInventory;
+          import net.minecraft.item.Item;
+          import net.minecraft.item.ItemStack;
+          import net.minecraft.item.Items;
+          import net.minecraft.registry.Registries;
+          import net.minecraft.registry.entry.RegistryEntry;
+          import net.minecraft.registry.tag.BlockTags;
+          import net.minecraft.screen.slot.SlotActionType;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Hand;
+          import net.minecraft.util.Identifier;
+          import net.minecraft.util.hit.BlockHitResult;
+          import net.minecraft.util.hit.HitResult;
+          import net.minecraft.util.math.BlockPos;
+          import net.minecraft.util.math.Direction;
+          import net.minecraft.util.math.Vec3d;
+
+          public class Swappers {
+              private static int spearTicks = -1;
+              private static int spearPrev = -1;
+
+              private static boolean isChestplate(ItemStack s) {
+                  if (s.isOf(Items.ELYTRA)) return false;
+                  EquippableComponent e = s.get(DataComponentTypes.EQUIPPABLE);
+                  return e != null && e.slot() == EquipmentSlot.CHEST;
+              }
+
+              private static void click(MinecraftClient mc, ClientPlayerEntity p, int slot) {
+                  mc.interactionManager.clickSlot(p.playerScreenHandler.syncId, slot, 0, SlotActionType.PICKUP, p);
+              }
+
+              private static int hot(PlayerInventory inv, Item item) {
+                  for (int i = 0; i < 9; i++) {
+                      if (inv.getStack(i).isOf(item)) return i;
+                  }
+                  return -1;
+              }
+
+              private static BlockHitResult aimed(MinecraftClient mc) {
+                  if (mc.crosshairTarget instanceof BlockHitResult h && h.getType() == HitResult.Type.BLOCK) return h;
+                  return null;
+              }
+
+              public static void elytra(MinecraftClient mc) {
+                  ClientPlayerEntity p = mc.player;
+                  if (p == null || mc.interactionManager == null) return;
+
+                  boolean wearingElytra = p.getEquippedStack(EquipmentSlot.CHEST).isOf(Items.ELYTRA);
+                  int found = -1;
+                  for (int i = 9; i <= 44; i++) {
+                      ItemStack s = p.playerScreenHandler.getSlot(i).getStack();
+                      if (s.isEmpty()) continue;
+                      if (wearingElytra ? isChestplate(s) : s.isOf(Items.ELYTRA)) {
+                          found = i;
+                          break;
+                      }
+                  }
+                  if (found < 0) {
+                      p.sendMessage(Text.literal(wearingElytra ? "Chestplate tidak ditemukan" : "Elytra tidak ditemukan"), true);
+                      return;
+                  }
+                  click(mc, p, found);
+                  click(mc, p, 6);
+                  click(mc, p, found);
+                  p.sendMessage(Text.literal(wearingElytra ? "Swap ke Chestplate" : "Swap ke Elytra"), true);
+              }
+
+              private static boolean isSpear(ItemStack s) {
+                  if (s.isEmpty()) return false;
+                  return Registries.ITEM.getId(s.getItem()).getPath().endsWith("_spear");
+              }
+
+              private static boolean hasLunge(ItemStack s) {
+                  Identifier lunge = Identifier.ofVanilla("lunge");
+                  for (RegistryEntry<Enchantment> e : s.getEnchantments().getEnchantments()) {
+                      if (e.matchesId(lunge)) return true;
+                  }
+                  return false;
+              }
+
+              public static void spear(MinecraftClient mc) {
+                  ClientPlayerEntity p = mc.player;
+                  if (p == null || mc.interactionManager == null) return;
+
+                  PlayerInventory inv = p.getInventory();
+                  int best = -1, fallback = -1;
+                  for (int i = 0; i < 9; i++) {
+                      ItemStack s = inv.getStack(i);
+                      if (!isSpear(s)) continue;
+                      if (hasLunge(s)) {
+                          best = i;
+                          break;
+                      }
+                      if (fallback < 0) fallback = i;
+                  }
+                  int slot = best >= 0 ? best : fallback;
+                  if (slot < 0) {
+                      p.sendMessage(Text.literal("Spear tidak ada di hotbar"), true);
+                      return;
+                  }
+                  if (spearPrev < 0) spearPrev = inv.getSelectedSlot();
+                  inv.setSelectedSlot(slot);
+                  spearTicks = 3;
+
+                  // Simulasikan klik kiri (jab) supaya lunge aktif pada tick berikutnya
+                  InputUtil.Key k = InputUtil.fromTranslationKey(mc.options.attackKey.getBoundKeyTranslationKey());
+                  KeyBinding.onKeyPressed(k);
+              }
+
+              private static boolean isRailItem(ItemStack s) {
+                  if (s.isEmpty()) return false;
+                  return Registries.ITEM.getId(s.getItem()).getPath().endsWith("rail");
+              }
+
+              /** Pasang rel di blok yang dibidik, lalu langsung pasang TNT Minecart di atasnya. */
+              public static void tntCart(MinecraftClient mc) {
+                  ClientPlayerEntity p = mc.player;
+                  if (p == null || mc.interactionManager == null || mc.world == null) return;
+
+                  BlockHitResult hit = aimed(mc);
+                  if (hit == null) {
+                      p.sendMessage(Text.literal("Arahkan ke blok atau rel"), true);
+                      return;
+                  }
+                  PlayerInventory inv = p.getInventory();
+                  int rail = -1, cart = -1;
+                  for (int i = 0; i < 9; i++) {
+                      ItemStack s = inv.getStack(i);
+                      if (rail < 0 && isRailItem(s)) rail = i;
+                      if (cart < 0 && s.isOf(Items.TNT_MINECART)) cart = i;
+                  }
+                  if (cart < 0) {
+                      p.sendMessage(Text.literal("TNT Minecart tidak ada di hotbar"), true);
+                      return;
+                  }
+
+                  BlockPos target = hit.getBlockPos();
+                  boolean targetIsRail = mc.world.getBlockState(target).isIn(BlockTags.RAILS);
+                  BlockPos railPos;
+                  int prev = inv.getSelectedSlot();
+
+                  if (targetIsRail) {
+                      railPos = target;
+                  } else {
+                      if (rail < 0) {
+                          p.sendMessage(Text.literal("Rel tidak ada di hotbar"), true);
+                          return;
+                      }
+                      railPos = target.offset(hit.getSide());
+                      inv.setSelectedSlot(rail);
+                      mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, hit);
+                  }
+
+                  inv.setSelectedSlot(cart);
+                  BlockHitResult cartHit = new BlockHitResult(Vec3d.ofCenter(railPos), Direction.UP, railPos, false);
+                  mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, cartHit);
+                  p.swingHand(Hand.MAIN_HAND);
+                  inv.setSelectedSlot(prev);
+              }
+
+              /** Pasang obsidian di blok yang dibidik, lalu End Crystal di atasnya. */
+              public static void obsidianCrystal(MinecraftClient mc) {
+                  ClientPlayerEntity p = mc.player;
+                  if (p == null || mc.interactionManager == null || mc.world == null) return;
+
+                  BlockHitResult hit = aimed(mc);
+                  if (hit == null) {
+                      p.sendMessage(Text.literal("Arahkan ke sebuah blok"), true);
+                      return;
+                  }
+                  PlayerInventory inv = p.getInventory();
+                  int obs = hot(inv, Items.OBSIDIAN);
+                  int cry = hot(inv, Items.END_CRYSTAL);
+                  if (cry < 0) {
+                      p.sendMessage(Text.literal("End Crystal tidak ada di hotbar"), true);
+                      return;
+                  }
+
+                  BlockPos target = hit.getBlockPos();
+                  BlockState bs = mc.world.getBlockState(target);
+                  BlockPos base;
+                  int prev = inv.getSelectedSlot();
+
+                  if (bs.isOf(Blocks.OBSIDIAN) || bs.isOf(Blocks.BEDROCK)) {
+                      base = target;
+                  } else {
+                      if (obs < 0) {
+                          p.sendMessage(Text.literal("Obsidian tidak ada di hotbar"), true);
+                          return;
+                      }
+                      base = target.offset(hit.getSide());
+                      inv.setSelectedSlot(obs);
+                      mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, hit);
+                  }
+
+                  inv.setSelectedSlot(cry);
+                  BlockHitResult top = new BlockHitResult(
+                          new Vec3d(base.getX() + 0.5, base.getY() + 1.0, base.getZ() + 0.5), Direction.UP, base, false);
+                  mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, top);
+                  p.swingHand(Hand.MAIN_HAND);
+                  inv.setSelectedSlot(prev);
+              }
+
+              /** Pasang Respawn Anchor di blok yang dibidik, lalu isi dengan Glowstone. */
+              public static void anchorGlow(MinecraftClient mc) {
+                  ClientPlayerEntity p = mc.player;
+                  if (p == null || mc.interactionManager == null || mc.world == null) return;
+
+                  BlockHitResult hit = aimed(mc);
+                  if (hit == null) {
+                      p.sendMessage(Text.literal("Arahkan ke sebuah blok"), true);
+                      return;
+                  }
+                  PlayerInventory inv = p.getInventory();
+                  int anchor = hot(inv, Items.RESPAWN_ANCHOR);
+                  int glow = hot(inv, Items.GLOWSTONE);
+                  if (glow < 0) {
+                      p.sendMessage(Text.literal("Glowstone tidak ada di hotbar"), true);
+                      return;
+                  }
+
+                  BlockPos target = hit.getBlockPos();
+                  BlockState bs = mc.world.getBlockState(target);
+                  BlockPos base;
+                  int prev = inv.getSelectedSlot();
+
+                  if (bs.isOf(Blocks.RESPAWN_ANCHOR)) {
+                      base = target;
+                  } else {
+                      if (anchor < 0) {
+                          p.sendMessage(Text.literal("Respawn Anchor tidak ada di hotbar"), true);
+                          return;
+                      }
+                      base = target.offset(hit.getSide());
+                      inv.setSelectedSlot(anchor);
+                      mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, hit);
+                  }
+
+                  inv.setSelectedSlot(glow);
+                  BlockHitResult charge = new BlockHitResult(Vec3d.ofCenter(base), Direction.UP, base, false);
+                  mc.interactionManager.interactBlock(p, Hand.MAIN_HAND, charge);
+                  p.swingHand(Hand.MAIN_HAND);
+                  inv.setSelectedSlot(prev);
+              }
+
+              public static void tick(MinecraftClient mc) {
+                  if (spearTicks > 0) {
+                      spearTicks--;
+                      if (spearTicks == 0) {
+                          if (mc.player != null && spearPrev >= 0) {
+                              mc.player.getInventory().setSelectedSlot(spearPrev);
+                          }
+                          spearPrev = -1;
+                          spearTicks = -1;
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/Crosshair.java <<'EOF'
+          package com.example.clientutils;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.DrawContext;
+
+          public class Crosshair {
+              public static final String[] STYLES = {"Dot", "Plus", "Plus + Dot", "Bracket Plus", "Square"};
+
+              private static void rect(DrawContext c, int xa, int ya, int xb, int yb, int col) {
+                  c.fill(Math.min(xa, xb), Math.min(ya, yb), Math.max(xa, xb), Math.max(ya, yb), col);
+              }
+
+              private static void plus(DrawContext c, int cx, int cy, int u, int col) {
+                  int t = u, h = t / 2, gap = 2 * u, len = 4 * u;
+                  rect(c, cx - h, cy - gap - len, cx - h + t, cy - gap, col);
+                  rect(c, cx - h, cy + gap, cx - h + t, cy + gap + len, col);
+                  rect(c, cx - gap - len, cy - h, cx - gap, cy - h + t, col);
+                  rect(c, cx + gap, cy - h, cx + gap + len, cy - h + t, col);
+              }
+
+              private static void dot(DrawContext c, int cx, int cy, int u, int col) {
+                  int h = u / 2;
+                  rect(c, cx - h, cy - h, cx - h + u, cy - h + u, col);
+              }
+
+              public static void draw(DrawContext c, int cx, int cy, int style, int u, int rgb) {
+                  int col = 0xFF000000 | (rgb & 0xFFFFFF);
+                  int t = u;
+                  switch (style) {
+                      case 0 -> rect(c, cx - u, cy - u, cx + u, cy + u, col);
+                      case 1 -> plus(c, cx, cy, u, col);
+                      case 2 -> {
+                          plus(c, cx, cy, u, col);
+                          dot(c, cx, cy, u, col);
+                      }
+                      case 3 -> {
+                          plus(c, cx, cy, u, col);
+                          dot(c, cx, cy, u, col);
+                          int d = 7 * u, arm = 3 * u;
+                          for (int sx = -1; sx <= 1; sx += 2) {
+                              for (int sy = -1; sy <= 1; sy += 2) {
+                                  int x = cx + sx * d, y = cy + sy * d;
+                                  rect(c, x, y, x - sx * arm, y - sy * t, col);
+                                  rect(c, x, y, x - sx * t, y - sy * arm, col);
+                              }
+                          }
+                      }
+                      default -> {
+                          int r = 5 * u;
+                          rect(c, cx - r, cy - r, cx + r, cy - r + t, col);
+                          rect(c, cx - r, cy + r - t, cx + r, cy + r, col);
+                          rect(c, cx - r, cy - r, cx - r + t, cy + r, col);
+                          rect(c, cx + r - t, cy - r, cx + r, cy + r, col);
+                      }
+                  }
+              }
+
+              public static void renderHud(DrawContext ctx, MinecraftClient mc) {
+                  Config cfg = Config.get();
+                  int cx = mc.getWindow().getScaledWidth() / 2;
+                  int cy = mc.getWindow().getScaledHeight() / 2;
+                  boolean target = mc.targetedEntity != null;
+                  draw(ctx, cx, cy, cfg.crosshairStyle, cfg.crosshairSize,
+                          target ? cfg.crosshairTargetColor : cfg.crosshairColor);
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/Hud.java <<'EOF'
+          package com.example.clientutils;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.font.TextRenderer;
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.network.ClientPlayerEntity;
+          import net.minecraft.client.render.RenderTickCounter;
+          import net.minecraft.entity.LivingEntity;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.math.MathHelper;
+          import net.minecraft.util.math.Vec3d;
+          import org.lwjgl.glfw.GLFW;
+
+          import java.util.ArrayDeque;
+          import java.util.ArrayList;
+          import java.util.Comparator;
+          import java.util.Deque;
+          import java.util.List;
+
+          public class Hud {
+              private static final String[] ARROWS = {
+                      "\u2191", "\u2197", "\u2192", "\u2198", "\u2193", "\u2199", "\u2190", "\u2196"
+              };
+
+              private static final Deque<Long> LMB = new ArrayDeque<>();
+              private static final Deque<Long> RMB = new ArrayDeque<>();
+              private static boolean lDown, rDown;
+
+              private static String arrow(double rel) {
+                  int i = (int) Math.round(rel / 45.0);
+                  i = ((i % 8) + 8) % 8;
+                  return ARROWS[i];
+              }
+
+              private static double dist(ClientPlayerEntity p, Config.Waypoint w) {
+                  double dx = w.x + 0.5 - p.getX();
+                  double dy = w.y - p.getY();
+                  double dz = w.z + 0.5 - p.getZ();
+                  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+              }
+
+              private static String direction(ClientPlayerEntity p, Config.Waypoint w) {
+                  double dx = w.x + 0.5 - p.getX();
+                  double dz = w.z + 0.5 - p.getZ();
+                  double targetYaw = Math.toDegrees(Math.atan2(-dx, dz));
+                  double rel = MathHelper.wrapDegrees(targetYaw - (double) p.getYaw());
+                  return arrow(rel);
+              }
+
+              /** Proyeksi posisi dunia ke koordinat layar (GUI scaled). null jika di belakang kamera. */
+              private static int[] project(MinecraftClient mc, ClientPlayerEntity p, float td,
+                                           double wx, double wy, double wz) {
+                  double ex, ey, ez, yawDeg, pitchDeg;
+                  if (Freecam.active) {
+                      ex = Freecam.x;
+                      ey = Freecam.y;
+                      ez = Freecam.z;
+                      yawDeg = Freecam.yaw;
+                      pitchDeg = Freecam.pitch;
+                  } else {
+                      Vec3d pos = p.getLerpedPos(td);
+                      ex = pos.x;
+                      ey = pos.y + (p.getEyeY() - p.getY());
+                      ez = pos.z;
+                      yawDeg = Freelook.active ? Freelook.yaw : p.getYaw(td);
+                      pitchDeg = Freelook.active ? Freelook.pitch : p.getPitch(td);
+                  }
+                  double dx = wx - ex, dy = wy - ey, dz = wz - ez;
+
+                  double yaw = Math.toRadians(yawDeg);
+                  double pitch = Math.toRadians(pitchDeg);
+                  double fx = -Math.sin(yaw) * Math.cos(pitch);
+                  double fy = -Math.sin(pitch);
+                  double fz = Math.cos(yaw) * Math.cos(pitch);
+                  double rx = -Math.cos(yaw), ry = 0, rz = -Math.sin(yaw);
+                  double ux = ry * fz - rz * fy;
+                  double uy = rz * fx - rx * fz;
+                  double uz = rx * fy - ry * fx;
+
+                  double zc = dx * fx + dy * fy + dz * fz;
+                  if (zc <= 0.05) return null;
+                  double xc = dx * rx + dy * ry + dz * rz;
+                  double yc = dx * ux + dy * uy + dz * uz;
+
+                  int W = mc.getWindow().getScaledWidth();
+                  int H = mc.getWindow().getScaledHeight();
+                  double fov = mc.options.getFov().getValue();
+                  double scale = (H / 2.0) / Math.tan(Math.toRadians(fov) / 2.0);
+                  return new int[]{(int) (W / 2.0 + xc / zc * scale), (int) (H / 2.0 - yc / zc * scale)};
+              }
+
+              private static void track(MinecraftClient mc) {
+                  long now = System.currentTimeMillis();
+                  long h = mc.getWindow().getHandle();
+                  boolean l = mc.currentScreen == null
+                          && GLFW.glfwGetMouseButton(h, GLFW.GLFW_MOUSE_BUTTON_LEFT) == GLFW.GLFW_PRESS;
+                  boolean r = mc.currentScreen == null
+                          && GLFW.glfwGetMouseButton(h, GLFW.GLFW_MOUSE_BUTTON_RIGHT) == GLFW.GLFW_PRESS;
+                  if (l && !lDown) LMB.addLast(now);
+                  if (r && !rDown) RMB.addLast(now);
+                  lDown = l;
+                  rDown = r;
+                  while (!LMB.isEmpty() && now - LMB.peekFirst() > 1000) LMB.pollFirst();
+                  while (!RMB.isEmpty() && now - RMB.peekFirst() > 1000) RMB.pollFirst();
+              }
+
+              private static void key(DrawContext c, TextRenderer tr, int x, int y, int w, int h, String t, boolean down) {
+                  c.fill(x, y, x + w, y + h, down ? 0xAAFFFFFF : 0x88000000);
+                  c.drawCenteredTextWithShadow(tr, Text.literal(t), x + w / 2, y + (h - 8) / 2,
+                          down ? 0xFF000000 : 0xFFFFFFFF);
+              }
+
+              /** Keystrokes versi kecil. Lebar total 49px. */
+              private static void keystrokes(DrawContext c, MinecraftClient mc, TextRenderer tr, Config cfg, int x, int y) {
+                  var o = mc.options;
+                  key(c, tr, x + 17, y, 15, 15, "W", o.forwardKey.isPressed());
+                  key(c, tr, x, y + 17, 15, 15, "A", o.leftKey.isPressed());
+                  key(c, tr, x + 17, y + 17, 15, 15, "S", o.backKey.isPressed());
+                  key(c, tr, x + 34, y + 17, 15, 15, "D", o.rightKey.isPressed());
+                  int yy = y + 34;
+                  if (cfg.keystrokesSpace) {
+                      key(c, tr, x, yy, 49, 9, "-", o.jumpKey.isPressed());
+                      yy += 11;
+                  }
+                  if (cfg.keystrokesMouse) {
+                      key(c, tr, x, yy, 24, 14, "LMB", o.attackKey.isPressed());
+                      key(c, tr, x + 25, yy, 24, 14, "RMB", o.useKey.isPressed());
+                  }
+              }
+
+              /** Penanda waypoint: hanya kotak berwarna. Nama dan koordinat muncul saat bidikan tepat di penanda. */
+              private static void marker(DrawContext ctx, TextRenderer tr, Config cfg, ClientPlayerEntity p,
+                                         Config.Waypoint w, int sx, int sy, boolean aimed) {
+                  int col = 0xFF000000 | (w.color & 0xFFFFFF);
+                  ctx.fill(sx - 7, sy - 7, sx + 7, sy + 7, 0xFF000000);
+                  ctx.fill(sx - 6, sy - 6, sx + 6, sy + 6, col);
+                  String init = (w.name == null || w.name.isEmpty()) ? "?" : w.name.substring(0, 1).toUpperCase();
+                  ctx.drawCenteredTextWithShadow(tr, Text.literal(init), sx, sy - 4, 0xFFFFFFFF);
+
+                  if (!aimed) return;
+
+                  String name = w.name == null ? "" : w.name;
+                  String coords = w.x + ", " + w.y + ", " + w.z;
+                  List<String> rows = new ArrayList<>();
+                  rows.add(name);
+                  rows.add(coords);
+                  if (cfg.waypointDistance) rows.add((int) dist(p, w) + "m");
+
+                  int width = 0;
+                  for (String r : rows) width = Math.max(width, tr.getWidth(r));
+                  int y = sy + 10;
+                  ctx.fill(sx - width / 2 - 3, y - 1, sx + width / 2 + 3, y + rows.size() * 10 + 1, 0xAA000000);
+                  for (int i = 0; i < rows.size(); i++) {
+                      int color = i == 0 ? 0xFFFFFFFF : (i == 1 ? col : 0xFFCCCCCC);
+                      ctx.drawCenteredTextWithShadow(tr, Text.literal(rows.get(i)), sx, y + i * 10, color);
+                  }
+              }
+
+              public static void render(DrawContext ctx, RenderTickCounter tick) {
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  if (mc.player == null || mc.world == null || mc.options.hudHidden) return;
+
+                  Config cfg = Config.get();
+                  ClientPlayerEntity p = mc.player;
+                  TextRenderer tr = mc.textRenderer;
+                  int W = mc.getWindow().getScaledWidth();
+                  int H = mc.getWindow().getScaledHeight();
+                  int cx = W / 2, cy = H / 2;
+                  float td = tick.getTickProgress(false);
+
+                  track(mc);
+
+                  List<String> lines = new ArrayList<>();
+
+                  if (cfg.fps) lines.add("FPS: " + mc.getCurrentFps());
+                  if (cfg.cps) lines.add("CPS: " + LMB.size() + " | " + RMB.size());
+                  if (Freecam.active) lines.add("FREECAM (J untuk keluar)");
+
+                  if (cfg.healthIndicator) {
+                      lines.add(String.format("HP: %.1f / %.1f", p.getHealth(), p.getMaxHealth()));
+                      if (mc.targetedEntity instanceof LivingEntity le) {
+                          float hp = le.getHealth();
+                          float max = Math.max(1f, le.getMaxHealth());
+                          Text label = Text.empty().append(le.getDisplayName())
+                                  .append(Text.literal(String.format("  %.1f / %.1f", hp, max)));
+                          ctx.drawCenteredTextWithShadow(tr, label, cx, 8, 0xFFFFFFFF);
+                          int bw = 100;
+                          int x1 = cx - bw / 2;
+                          int fill = (int) (bw * Math.min(1f, hp / max));
+                          int color = hp / max > 0.5f ? 0xFF55FF55 : (hp / max > 0.25f ? 0xFFFFFF55 : 0xFFFF5555);
+                          ctx.fill(x1 - 1, 20, x1 + bw + 1, 26, 0xFF000000);
+                          ctx.fill(x1, 21, x1 + fill, 25, color);
+                      }
+                  }
+
+                  if (cfg.coordinates) {
+                      lines.add(String.format("XYZ: %d %d %d", p.getBlockX(), p.getBlockY(), p.getBlockZ()));
+                  }
+
+                  // Hanya waypoint di dimensi (kategori) yang sedang kamu tempati
+                  String dim = mc.world.getRegistryKey().getValue().toString();
+                  List<Config.Waypoint> here = new ArrayList<>();
+                  for (Config.Waypoint w : cfg.list) {
+                      if (dim.equals(w.dim)) here.add(w);
+                  }
+                  here.sort(Comparator.comparingDouble(w -> dist(p, w)));
+
+                  if (cfg.waypoints) {
+                      for (Config.Waypoint w : here) {
+                          int[] s = project(mc, p, td, w.x + 0.5, w.y + 1.0, w.z + 0.5);
+                          if (s == null) continue;
+                          if (s[0] < -20 || s[0] > W + 20 || s[1] < -20 || s[1] > H + 20) continue;
+                          boolean aimed = Math.abs(s[0] - cx) <= 10 && Math.abs(s[1] - cy) <= 10;
+                          marker(ctx, tr, cfg, p, w, s[0], s[1], aimed);
+                      }
+                  }
+
+                  if (cfg.waypointArrow && !here.isEmpty()) {
+                      Config.Waypoint n = here.get(0);
+                      String s = direction(p, n) + " " + n.name + " (" + (int) dist(p, n) + "m)";
+                      ctx.drawCenteredTextWithShadow(tr, Text.literal(s), cx, 32, 0xFF000000 | (n.color & 0xFFFFFF));
+                  }
+
+                  if (cfg.waypointList && !here.isEmpty()) {
+                      lines.add("-- Waypoints --");
+                      int count = Math.min(5, here.size());
+                      for (int i = 0; i < count; i++) {
+                          Config.Waypoint w = here.get(i);
+                          lines.add(direction(p, w) + " " + w.name + " " + (int) dist(p, w) + "m");
+                      }
+                  }
+
+                  int y = 6;
+                  for (String l : lines) {
+                      ctx.drawTextWithShadow(tr, Text.literal(l), 6, y, 0xFFFFFFFF);
+                      y += 10;
+                  }
+
+                  if (cfg.keystrokes) {
+                      keystrokes(ctx, mc, tr, cfg, W - 56, cy - 24);
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/Ui.java <<'EOF'
+          package com.example.clientutils;
+
+          import net.minecraft.client.gui.DrawContext;
+
+          public class Ui {
+              public static final int BG = 0xF0141420;
+              public static final int BORDER = 0xFF30304A;
+              public static final int PILL = 0xFFE0505E;
+              public static final int ON_BG = 0xFF2A4A35;
+              public static final int ON_BD = 0xFF4CAF50;
+              public static final int OFF_BG = 0xFF4A2A32;
+              public static final int OFF_BD = 0xFFB04858;
+              public static final int[] PALETTE = {
+                      0xFFFFFF, 0xFF5555, 0xFFAA00, 0xFFFF55, 0x55FF55, 0x00AAAA,
+                      0x55FFFF, 0x5555FF, 0xAA00AA, 0xFF55FF, 0xAAAAAA, 0x000000
+              };
+
+              public static void border(DrawContext c, int x, int y, int w, int h, int col) {
+                  c.fill(x, y, x + w, y + 1, col);
+                  c.fill(x, y + h - 1, x + w, y + h, col);
+                  c.fill(x, y, x + 1, y + h, col);
+                  c.fill(x + w - 1, y, x + w, y + h, col);
+              }
+
+              public static void box(DrawContext c, int x, int y, int w, int h, int bg, int bd) {
+                  c.fill(x, y, x + w, y + h, bg);
+                  border(c, x, y, w, h, bd);
+              }
+
+              public static String hex(int rgb) {
+                  return String.format("#%06X", rgb & 0xFFFFFF);
+              }
+
+              public static Integer parseHex(String s) {
+                  try {
+                      s = s.trim();
+                      if (s.startsWith("#")) s = s.substring(1);
+                      if (s.length() != 6) return null;
+                      return Integer.parseInt(s, 16);
+                  } catch (Exception e) {
+                      return null;
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/Features.java <<'EOF'
+          package com.example.clientutils;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.function.Consumer;
+          import java.util.function.Supplier;
+
+          public class Features {
+              public static class F {
+                  public final String id, name;
+                  public final Supplier<Boolean> get;
+                  public final Consumer<Boolean> set;
+                  public final boolean settings;
+
+                  F(String id, String name, Supplier<Boolean> get, Consumer<Boolean> set, boolean settings) {
+                      this.id = id;
+                      this.name = name;
+                      this.get = get;
+                      this.set = set;
+                      this.settings = settings;
+                  }
+              }
+
+              public static List<F> all() {
+                  List<F> l = new ArrayList<>();
+                  l.add(new F("health", "Health", () -> Config.get().healthIndicator, v -> Config.get().healthIndicator = v, false));
+                  l.add(new F("waypoints", "Waypoints", () -> Config.get().waypoints, v -> Config.get().waypoints = v, true));
+                  l.add(new F("wplist", "WP List", () -> Config.get().waypointList, v -> Config.get().waypointList = v, false));
+                  l.add(new F("coords", "Coords", () -> Config.get().coordinates, v -> Config.get().coordinates = v, false));
+                  l.add(new F("elytra", "Elytra Swap", () -> Config.get().elytraSwapper, v -> Config.get().elytraSwapper = v, false));
+                  l.add(new F("spear", "Spear Swap", () -> Config.get().spearSwapper, v -> Config.get().spearSwapper = v, false));
+                  l.add(new F("crosshair", "Crosshair", () -> Config.get().crosshair, v -> Config.get().crosshair = v, true));
+                  l.add(new F("keystrokes", "Keystrokes", () -> Config.get().keystrokes, v -> Config.get().keystrokes = v, true));
+                  l.add(new F("fps", "FPS", () -> Config.get().fps, v -> Config.get().fps = v, false));
+                  l.add(new F("cps", "CPS", () -> Config.get().cps, v -> Config.get().cps = v, false));
+                  l.add(new F("freelook", "Freelook", () -> Config.get().freelook, v -> Config.get().freelook = v, true));
+                  l.add(new F("fullbright", "Fullbright", () -> Config.get().fullbright, v -> Config.get().fullbright = v, false));
+                  l.add(new F("tnt", "TNT Cart", () -> Config.get().tntCart, v -> Config.get().tntCart = v, true));
+                  l.add(new F("totem", "Auto Totem", () -> Config.get().autoTotem, v -> Config.get().autoTotem = v, false));
+
+                  l.add(new F("zoom", "Zoom", () -> Config.get().zoom, v -> Config.get().zoom = v, true));
+                  l.add(new F("obs", "Obs+Crystal", () -> Config.get().obsCrystal, v -> Config.get().obsCrystal = v, true));
+                  l.add(new F("anchor", "Anchor+Glow", () -> Config.get().anchorGlow, v -> Config.get().anchorGlow = v, true));
+                  l.add(new F("freecam", "Freecam", () -> Config.get().freecam, v -> Config.get().freecam = v, true));
+                  l.add(new F("viewmodel", "View Model", () -> Config.get().viewModel, v -> Config.get().viewModel = v, true));
+                  return l;
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/BaseScreen.java <<'EOF'
+          package com.example.clientutils;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.TextFieldWidget;
+          import net.minecraft.text.Text;
+          import net.minecraft.util.Formatting;
+
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.function.Consumer;
+          import java.util.function.IntConsumer;
+          import java.util.function.IntSupplier;
+          import java.util.function.Supplier;
+
+          public abstract class BaseScreen extends Screen {
+              protected final Screen parent;
+              protected final String header;
+              protected int px, py, pw, ph;
+              protected final List<Object[]> labels = new ArrayList<>();
+              protected final List<int[]> swatches = new ArrayList<>();
+
+              protected BaseScreen(Screen parent, String header) {
+                  super(Text.literal(header));
+                  this.parent = parent;
+                  this.header = header;
+              }
+
+              protected abstract void build();
+
+              protected int pillX() {
+                  return px + 10;
+              }
+
+              @Override
+              protected void init() {
+                  pw = Math.min(this.width - 16, 360);
+                  ph = Math.min(this.height - 16, 230);
+                  px = (this.width - pw) / 2;
+                  py = (this.height - ph) / 2;
+                  labels.clear();
+                  swatches.clear();
+                  if (parent != null) {
+                      addDrawableChild(ButtonWidget.builder(Text.empty(), b -> this.client.setScreen(parent))
+                              .dimensions(pillX(), py + 8, 130, 20).build());
+                  }
+                  build();
+              }
+
+              protected void label(String s, int x, int y) {
+                  labels.add(new Object[]{s, x, y});
+              }
+
+              protected void toggle(int y, String name, Supplier<Boolean> get, Consumer<Boolean> set) {
+                  addDrawableChild(ButtonWidget.builder(onOff(name, get.get()), btn -> {
+                      set.accept(!get.get());
+                      Config.save();
+                      btn.setMessage(onOff(name, get.get()));
+                  }).dimensions(px + 14, y, 230, 20).build());
+              }
+
+              protected static Text onOff(String name, boolean on) {
+                  return Text.literal(name + ": ")
+                          .append(Text.literal(on ? "ON" : "OFF").formatted(on ? Formatting.GREEN : Formatting.RED));
+              }
+
+              /** Baris pilih warna: label, kolom hex, dan palet warna. Tinggi baris = 30. */
+              protected void colorRow(int y, String name, IntSupplier get, IntConsumer set) {
+                  int x = px + 14;
+                  label(name, x, y);
+                  TextFieldWidget f = new TextFieldWidget(this.textRenderer, x, y + 11, 56, 16, Text.literal(name));
+                  f.setMaxLength(7);
+                  f.setText(Ui.hex(get.getAsInt()));
+                  f.setChangedListener(s -> {
+                      Integer v = Ui.parseHex(s);
+                      if (v != null) set.accept(v);
+                  });
+                  addDrawableChild(f);
+
+                  int sx = x + 64;
+                  for (int i = 0; i < Ui.PALETTE.length; i++) {
+                      final int c = Ui.PALETTE[i];
+                      int bx = sx + i * 15;
+                      addDrawableChild(ButtonWidget.builder(Text.empty(), b -> {
+                          set.accept(c);
+                          f.setText(Ui.hex(c));
+                      }).dimensions(bx, y + 12, 13, 13).build());
+                      swatches.add(new int[]{bx, y + 12, 13, c});
+                  }
+              }
+
+              @Override
+              public void renderBackground(DrawContext c, int mx, int my, float d) {
+                  super.renderBackground(c, mx, my, d);
+                  Ui.box(c, px, py, pw, ph, Ui.BG, Ui.BORDER);
+              }
+
+              @Override
+              public void render(DrawContext c, int mx, int my, float d) {
+                  super.render(c, mx, my, d);
+
+                  c.fill(pillX(), py + 8, pillX() + 130, py + 28, Ui.PILL);
+                  String t = parent != null ? "< " + header : header;
+                  c.drawCenteredTextWithShadow(this.textRenderer, Text.literal(t), pillX() + 65, py + 14, 0xFFFFFFFF);
+
+                  for (Object[] l : labels) {
+                      c.drawTextWithShadow(this.textRenderer, Text.literal((String) l[0]),
+                              (Integer) l[1], (Integer) l[2], 0xFFFFFFFF);
+                  }
+                  for (int[] s : swatches) {
+                      c.fill(s[0], s[1], s[0] + s[2], s[1] + s[2], 0xFF000000 | s[3]);
+                      Ui.border(c, s[0] - 1, s[1] - 1, s[2] + 2, s[2] + 2, 0xFF888888);
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/ModMenuScreen.java <<'EOF'
+          package com.example.clientutils;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.TextFieldWidget;
+          import net.minecraft.text.Text;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class ModMenuScreen extends BaseScreen {
+              private final int tab;
+              private TextFieldWidget search;
+              private final List<Tile> tiles = new ArrayList<>();
+              private int tw, th, rowH, cx0;
+
+              private static class Tile {
+                  Features.F f;
+                  ButtonWidget toggle, gear;
+                  int x, y, w, h;
+                  boolean show;
+              }
+
+              public ModMenuScreen(int tab) {
+                  super(null, "Mod Menu");
+                  this.tab = tab;
+              }
+
+              @Override
+              protected int pillX() {
+                  return px + 44;
+              }
+
+              @Override
+              protected void build() {
+                  tiles.clear();
+                  addDrawableChild(ButtonWidget.builder(Text.empty(), b -> this.client.setScreen(new ModMenuScreen(0)))
+                          .dimensions(px + 6, py + 8, 34, 28).build());
+                  addDrawableChild(ButtonWidget.builder(Text.empty(), b -> this.client.setScreen(new ModMenuScreen(1)))
+                          .dimensions(px + 6, py + 40, 34, 28).build());
+
+                  if (tab == 0) buildMods();
+                  else buildGeneral();
+              }
+
+              private void buildMods() {
+                  cx0 = px + 44;
+                  int gw = pw - 52;
+                  tw = (gw - 12) / 3;
+                  int rows = (Features.all().size() + 2) / 3;
+                  rowH = Math.max(20, Math.min(34, (ph - 44) / rows));
+                  th = Math.max(16, rowH - 5);
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Clear"), b -> {
+                      if (search != null) search.setText("");
+                  }).dimensions(px + 180, py + 8, 36, 20).build());
+
+                  search = new TextFieldWidget(this.textRenderer, px + 220, py + 8, pw - 228, 20, Text.literal("Search"));
+                  search.setPlaceholder(Text.literal("Search mods..."));
+                  addDrawableChild(search);
+
+                  for (Features.F f : Features.all()) {
+                      Tile t = new Tile();
+                      t.f = f;
+                      int w = tw - (f.settings ? 16 : 0);
+                      t.toggle = ButtonWidget.builder(Text.empty(), b -> {
+                          f.set.accept(!f.get.get());
+                          Config.save();
+                      }).dimensions(0, 0, w, th).build();
+                      addDrawableChild(t.toggle);
+                      if (f.settings) {
+                          t.gear = ButtonWidget.builder(Text.empty(),
+                                  b -> this.client.setScreen(new SettingsScreen(this, f.id, f.name)))
+                                  .dimensions(0, 0, 14, th).build();
+                          addDrawableChild(t.gear);
+                      }
+                      tiles.add(t);
+                  }
+                  search.setChangedListener(s -> relayout());
+                  relayout();
+              }
+
+              private void relayout() {
+                  String q = search == null ? "" : search.getText().toLowerCase();
+                  int i = 0;
+                  for (Tile t : tiles) {
+                      boolean m = q.isEmpty() || t.f.name.toLowerCase().contains(q);
+                      t.show = m;
+                      t.toggle.visible = m;
+                      if (t.gear != null) t.gear.visible = m;
+                      if (!m) continue;
+                      int col = i % 3, row = i / 3;
+                      t.x = cx0 + col * (tw + 6);
+                      t.y = py + 34 + row * rowH;
+                      t.w = tw;
+                      t.h = th;
+                      t.toggle.setX(t.x);
+                      t.toggle.setY(t.y);
+                      if (t.gear != null) {
+                          t.gear.setX(t.x + tw - 14);
+                          t.gear.setY(t.y);
+                      }
+                      i++;
+                  }
+              }
+
+              private void buildGeneral() {
+                  int x = px + 50;
+                  int y = py + 34;
+                  label("Keybind (bisa diubah di Options > Controls):", x, y);
+                  label("U  -  Buka Mod Menu", x, y + 12);
+                  label("R  -  Elytra Swapper", x, y + 23);
+                  label("F  -  Spear Lunge (ubah 'Swap Offhand' bila bentrok)", x, y + 34);
+                  label("K  -  Pasang Rel + TNT Minecart", x, y + 45);
+                  label("F10  -  Obsidian + End Crystal", x, y + 56);
+                  label("F9  -  Respawn Anchor + Glowstone", x, y + 67);
+                  label("J  -  Freecam (tekan lagi untuk keluar)", x, y + 78);
+                  label("Z (tahan)  -  Zoom", x, y + 89);
+                  label("Left Alt (tahan)  -  Freelook", x, y + 100);
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Reset semua pengaturan"), b -> {
+                      Config.resetFeatures();
+                      this.client.setScreen(new ModMenuScreen(1));
+                  }).dimensions(x, y + 116, 200, 20).build());
+              }
+
+              @Override
+              public void render(DrawContext c, int mx, int my, float d) {
+                  super.render(c, mx, my, d);
+
+                  // sidebar tab
+                  Ui.box(c, px + 6, py + 8, 34, 28, tab == 0 ? 0xFF3A3A5A : 0xFF22222F, tab == 0 ? Ui.PILL : Ui.BORDER);
+                  c.drawCenteredTextWithShadow(this.textRenderer, Text.literal("Mods"), px + 23, py + 18, 0xFFFFFFFF);
+                  Ui.box(c, px + 6, py + 40, 34, 28, tab == 1 ? 0xFF3A3A5A : 0xFF22222F, tab == 1 ? Ui.PILL : Ui.BORDER);
+                  c.drawCenteredTextWithShadow(this.textRenderer, Text.literal("Info"), px + 23, py + 50, 0xFFFFFFFF);
+
+                  if (tab != 0) return;
+
+                  for (Tile t : tiles) {
+                      if (!t.show) continue;
+                      boolean on = t.f.get.get();
+                      int ww = t.f.settings ? t.w - 16 : t.w;
+                      Ui.box(c, t.x, t.y, ww, t.h, on ? Ui.ON_BG : Ui.OFF_BG, on ? Ui.ON_BD : Ui.OFF_BD);
+                      if (t.toggle.isHovered()) c.fill(t.x + 1, t.y + 1, t.x + ww - 1, t.y + t.h - 1, 0x22FFFFFF);
+                      String name = this.textRenderer.trimToWidth(t.f.name, ww - 10);
+                      c.drawTextWithShadow(this.textRenderer, Text.literal(name), t.x + 6, t.y + (t.h - 8) / 2, 0xFFFFFFFF);
+                      if (t.gear != null) {
+                          Ui.box(c, t.x + t.w - 14, t.y, 14, t.h, 0xFF2A2A3C, Ui.BORDER);
+                          if (t.gear.isHovered()) c.fill(t.x + t.w - 13, t.y + 1, t.x + t.w - 1, t.y + t.h - 1, 0x22FFFFFF);
+                          c.drawCenteredTextWithShadow(this.textRenderer, Text.literal(">"),
+                                  t.x + t.w - 7, t.y + (t.h - 8) / 2, 0xFFFFFFFF);
+                      }
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/SettingsScreen.java <<'EOF'
+          package com.example.clientutils;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.text.Text;
+
+          import java.util.function.Consumer;
+          import java.util.function.Supplier;
+
+          public class SettingsScreen extends BaseScreen {
+              private final String id;
+              private final String name;
+
+              public SettingsScreen(Screen parent, String id, String name) {
+                  super(parent, name);
+                  this.id = id;
+                  this.name = name;
+              }
+
+              private static String fmt(float v) {
+                  return String.format("%.2f", v);
+              }
+
+              /** Baris pengatur nilai: [-] nama: nilai [+] */
+              private void stepper(int y, String label, Supplier<Float> get, Consumer<Float> set,
+                                   float step, float min, float max) {
+                  ButtonWidget mid = ButtonWidget.builder(Text.literal(label + ": " + fmt(get.get())), b -> {
+                  }).dimensions(px + 44, y, 170, 20).build();
+                  ButtonWidget minus = ButtonWidget.builder(Text.literal("-"), b -> {
+                      float v = Math.max(min, Math.round((get.get() - step) * 100f) / 100f);
+                      set.accept(v);
+                      Config.save();
+                      mid.setMessage(Text.literal(label + ": " + fmt(v)));
+                  }).dimensions(px + 14, y, 26, 20).build();
+                  ButtonWidget plus = ButtonWidget.builder(Text.literal("+"), b -> {
+                      float v = Math.min(max, Math.round((get.get() + step) * 100f) / 100f);
+                      set.accept(v);
+                      Config.save();
+                      mid.setMessage(Text.literal(label + ": " + fmt(v)));
+                  }).dimensions(px + 218, y, 26, 20).build();
+                  addDrawableChild(minus);
+                  addDrawableChild(mid);
+                  addDrawableChild(plus);
+              }
+
+              @Override
+              protected void build() {
+                  Config c = Config.get();
+                  int y = py + 38;
+                  switch (id) {
+                      case "crosshair" -> {
+                          addDrawableChild(ButtonWidget.builder(styleText(), b -> {
+                              c.crosshairStyle = (c.crosshairStyle + 1) % Crosshair.STYLES.length;
+                              Config.save();
+                              b.setMessage(styleText());
+                          }).dimensions(px + 14, y, 140, 20).build());
+                          addDrawableChild(ButtonWidget.builder(sizeText(), b -> {
+                              c.crosshairSize = c.crosshairSize % 4 + 1;
+                              Config.save();
+                              b.setMessage(sizeText());
+                          }).dimensions(px + 160, y, 90, 20).build());
+                          colorRow(y + 28, "Color", () -> c.crosshairColor, v -> {
+                              c.crosshairColor = v;
+                              Config.save();
+                          });
+                          colorRow(y + 60, "Target Color", () -> c.crosshairTargetColor, v -> {
+                              c.crosshairTargetColor = v;
+                              Config.save();
+                          });
+                          label("Preview", px + 14, y + 96);
+                      }
+                      case "waypoints" -> {
+                          toggle(y, "Tampilkan jarak (saat dibidik)", () -> c.waypointDistance, v -> c.waypointDistance = v);
+                          toggle(y + 24, "Panah waypoint terdekat", () -> c.waypointArrow, v -> c.waypointArrow = v);
+                          addDrawableChild(ButtonWidget.builder(Text.literal("Kelola Waypoint..."),
+                                  b -> this.client.setScreen(new WaypointListScreen(this, 0)))
+                                  .dimensions(px + 14, y + 52, 230, 20).build());
+                          label("Nama dan koordinat muncul saat bidikan", px + 14, y + 80);
+                          label("tepat di penanda waypoint.", px + 14, y + 92);
+                      }
+                      case "keystrokes" -> {
+                          toggle(y, "Tampilkan mouse (LMB/RMB)", () -> c.keystrokesMouse, v -> c.keystrokesMouse = v);
+                          toggle(y + 24, "Tampilkan Spasi", () -> c.keystrokesSpace, v -> c.keystrokesSpace = v);
+                      }
+                      case "freelook" -> {
+                          label("Tahan Left Alt: kamera bebas (third person),", px + 14, y);
+                          label("arah badan dan tembakan tidak berubah.", px + 14, y + 12);
+                          label("Lepas tombol: kamera kembali normal.", px + 14, y + 24);
+                          label("Ganti tombol di Options > Controls.", px + 14, y + 40);
+                      }
+                      case "tnt" -> {
+                          label("Tekan K: arahkan ke blok, rel dipasang lalu", px + 14, y);
+                          label("TNT Minecart langsung dipasang di atasnya.", px + 14, y + 12);
+                          label("Kalau yang dibidik sudah rel, hanya cart.", px + 14, y + 24);
+                          label("Rel dan TNT Minecart harus ada di hotbar.", px + 14, y + 36);
+                      }
+                      case "zoom" -> {
+                          stepper(y, "Zoom", () -> c.zoomFactor, v -> c.zoomFactor = v, 0.5f, 1.5f, 10f);
+                          toggle(y + 26, "Animasi halus", () -> c.zoomSmooth, v -> c.zoomSmooth = v);
+                          label("Tahan Z untuk zoom (ganti di Controls).", px + 14, y + 58);
+                      }
+                      case "obs" -> {
+                          label("Tekan F10: arahkan ke blok. Obsidian dipasang", px + 14, y);
+                          label("di sisi yang dibidik, lalu End Crystal di atasnya.", px + 14, y + 12);
+                          label("Kalau yang dibidik sudah obsidian/bedrock,", px + 14, y + 24);
+                          label("hanya crystal yang dipasang.", px + 14, y + 36);
+                          label("Obsidian dan End Crystal harus ada di hotbar.", px + 14, y + 52);
+                      }
+                      case "anchor" -> {
+                          label("Tekan F9: arahkan ke blok. Respawn Anchor dipasang", px + 14, y);
+                          label("di sisi yang dibidik, lalu diisi Glowstone.", px + 14, y + 12);
+                          label("Kalau yang dibidik sudah anchor, hanya isi glowstone.", px + 14, y + 24);
+                          label("Anchor dan Glowstone harus ada di hotbar.", px + 14, y + 40);
+                      }
+                      case "freecam" -> {
+                          stepper(y, "Kecepatan", () -> c.freecamSpeed, v -> c.freecamSpeed = v, 2f, 2f, 60f);
+                          label("Tekan J untuk masuk/keluar. WASD, Spasi (naik),", px + 14, y + 30);
+                          label("Shift (turun), Ctrl (2x cepat). Badanmu tetap diam.", px + 14, y + 42);
+                          label("Klik kanan memasang blok dari bidikan kamera,", px + 14, y + 54);
+                          label("selama dalam jangkauan pemain (maks ~5 blok).", px + 14, y + 66);
+                      }
+                      case "viewmodel" -> {
+                          stepper(y, "X (kiri/kanan)", () -> c.vmX, v -> c.vmX = v, 0.05f, -2f, 2f);
+                          stepper(y + 24, "Y (atas/bawah)", () -> c.vmY, v -> c.vmY = v, 0.05f, -2f, 2f);
+                          stepper(y + 48, "Z (depan/belakang)", () -> c.vmZ, v -> c.vmZ = v, 0.05f, -2f, 2f);
+                          stepper(y + 72, "Ukuran", () -> c.vmScale, v -> c.vmScale = v, 0.05f, 0.2f, 2.5f);
+                          addDrawableChild(ButtonWidget.builder(Text.literal("Reset posisi & ukuran"), b -> {
+                              c.vmX = 0f;
+                              c.vmY = 0f;
+                              c.vmZ = 0f;
+                              c.vmScale = 1f;
+                              Config.save();
+                              this.client.setScreen(new SettingsScreen(parent, id, name));
+                          }).dimensions(px + 14, y + 100, 230, 20).build());
+                          label("Aktifkan fitur View Model di menu agar berlaku.", px + 14, y + 126);
+                      }
+                      default -> label("Tidak ada pengaturan.", px + 14, y);
+                  }
+              }
+
+              private Text styleText() {
+                  Config c = Config.get();
+                  return Text.literal("Style: " + Crosshair.STYLES[c.crosshairStyle % Crosshair.STYLES.length]);
+              }
+
+              private Text sizeText() {
+                  return Text.literal("Size: " + Config.get().crosshairSize);
+              }
+
+              @Override
+              public void render(DrawContext c, int mx, int my, float d) {
+                  super.render(c, mx, my, d);
+                  if (id.equals("crosshair")) {
+                      Config cfg = Config.get();
+                      int bx = px + 14, by = py + 148, bw = 110, bh = 60;
+                      Ui.box(c, bx, by, bw, bh, 0xFF22222F, Ui.BORDER);
+                      Crosshair.draw(c, bx + 30, by + bh / 2, cfg.crosshairStyle, cfg.crosshairSize, cfg.crosshairColor);
+                      Crosshair.draw(c, bx + 80, by + bh / 2, cfg.crosshairStyle, cfg.crosshairSize, cfg.crosshairTargetColor);
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/WaypointListScreen.java <<'EOF'
+          package com.example.clientutils;
+
+          import net.minecraft.client.gui.DrawContext;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.text.Text;
+
+          import java.util.ArrayList;
+          import java.util.List;
+
+          public class WaypointListScreen extends BaseScreen {
+              private static final int PER_PAGE = 5;
+              public static final String[] DIMS = {"minecraft:overworld", "minecraft:the_nether", "minecraft:the_end"};
+              public static final String[] NAMES = {"Overworld", "Nether", "End", "Lain"};
+              /** Kategori yang sedang dibuka: 0 Overworld, 1 Nether, 2 End, 3 Lain */
+              public static int cat = 0;
+
+              private final int page;
+              private final List<ButtonWidget> tabs = new ArrayList<>();
+
+              public WaypointListScreen(Screen parent, int page) {
+                  super(parent, "Waypoint");
+                  this.page = page;
+              }
+
+              public static int catOf(String dim) {
+                  for (int i = 0; i < DIMS.length; i++) {
+                      if (DIMS[i].equals(dim)) return i;
+                  }
+                  return 3;
+              }
+
+              private static List<Integer> filtered() {
+                  List<Integer> r = new ArrayList<>();
+                  List<Config.Waypoint> l = Config.get().list;
+                  for (int i = 0; i < l.size(); i++) {
+                      if (catOf(l.get(i).dim) == cat) r.add(i);
+                  }
+                  return r;
+              }
+
+              private static int maxPage() {
+                  return Math.max(0, (filtered().size() - 1) / PER_PAGE);
+              }
+
+              @Override
+              protected void build() {
+                  tabs.clear();
+                  int tabW = (pw - 28) / 4;
+                  for (int i = 0; i < 4; i++) {
+                      final int ci = i;
+                      ButtonWidget b = ButtonWidget.builder(Text.empty(), x -> {
+                          cat = ci;
+                          this.client.setScreen(new WaypointListScreen(parent, 0));
+                      }).dimensions(px + 14 + i * tabW, py + 34, tabW - 2, 18).build();
+                      addDrawableChild(b);
+                      tabs.add(b);
+                  }
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("+ Tambah"),
+                          b -> this.client.setScreen(new WaypointEditScreen(this, -1)))
+                          .dimensions(px + pw - 100, py + 8, 90, 20).build());
+
+                  List<Config.Waypoint> l = Config.get().list;
+                  List<Integer> f = filtered();
+                  int start = page * PER_PAGE;
+                  for (int i = 0; i < PER_PAGE; i++) {
+                      int k = start + i;
+                      if (k >= f.size()) break;
+                      final int idx = f.get(k);
+                      Config.Waypoint w = l.get(idx);
+                      int y = py + 58 + i * 24;
+
+                      swatches.add(new int[]{px + 14, y + 5, 10, w.color});
+                      String s = w.name + "  [" + w.x + ", " + w.y + ", " + w.z + "]";
+                      label(this.textRenderer.trimToWidth(s, pw - 140), px + 32, y + 6);
+
+                      addDrawableChild(ButtonWidget.builder(Text.literal("Edit"),
+                              b -> this.client.setScreen(new WaypointEditScreen(this, idx)))
+                              .dimensions(px + pw - 98, y, 40, 20).build());
+                      addDrawableChild(ButtonWidget.builder(Text.literal("Hapus"), b -> {
+                          Config.get().list.remove(idx);
+                          Config.save();
+                          this.client.setScreen(new WaypointListScreen(parent, Math.min(page, maxPage())));
+                      }).dimensions(px + pw - 54, y, 44, 20).build());
+                  }
+
+                  int by = py + ph - 26;
+                  ButtonWidget prev = ButtonWidget.builder(Text.literal("<"),
+                          b -> this.client.setScreen(new WaypointListScreen(parent, page - 1)))
+                          .dimensions(px + 14, by, 40, 20).build();
+                  prev.active = page > 0;
+                  addDrawableChild(prev);
+
+                  ButtonWidget next = ButtonWidget.builder(Text.literal(">"),
+                          b -> this.client.setScreen(new WaypointListScreen(parent, page + 1)))
+                          .dimensions(px + 60, by, 40, 20).build();
+                  next.active = page < maxPage();
+                  addDrawableChild(next);
+
+                  label("Hal. " + (page + 1) + "/" + (maxPage() + 1) + "   " + NAMES[cat] + ": " + f.size(),
+                          px + 110, by + 6);
+              }
+
+              @Override
+              public void render(DrawContext c, int mx, int my, float d) {
+                  super.render(c, mx, my, d);
+                  for (int i = 0; i < tabs.size(); i++) {
+                      ButtonWidget b = tabs.get(i);
+                      boolean sel = i == cat;
+                      Ui.box(c, b.getX(), b.getY(), b.getWidth(), b.getHeight(),
+                              sel ? 0xFF3A3A5A : 0xFF22222F, sel ? Ui.PILL : Ui.BORDER);
+                      if (b.isHovered()) {
+                          c.fill(b.getX() + 1, b.getY() + 1, b.getX() + b.getWidth() - 1,
+                                  b.getY() + b.getHeight() - 1, 0x22FFFFFF);
+                      }
+                      c.drawCenteredTextWithShadow(this.textRenderer, Text.literal(NAMES[i]),
+                              b.getX() + b.getWidth() / 2, b.getY() + 5, 0xFFFFFFFF);
+                  }
+              }
+          }
+          EOF
+
+          cat > src/main/java/com/example/clientutils/WaypointEditScreen.java <<'EOF'
+          package com.example.clientutils;
+
+          import net.minecraft.client.MinecraftClient;
+          import net.minecraft.client.gui.screen.Screen;
+          import net.minecraft.client.gui.widget.ButtonWidget;
+          import net.minecraft.client.gui.widget.TextFieldWidget;
+          import net.minecraft.text.Text;
+
+          public class WaypointEditScreen extends BaseScreen {
+              private final int idx;
+              private final Config.Waypoint w = new Config.Waypoint();
+              private TextFieldWidget nameF, xF, yF, zF;
+
+              public WaypointEditScreen(Screen parent, int idx) {
+                  super(parent, idx < 0 ? "Waypoint Baru" : "Edit Waypoint");
+                  this.idx = idx;
+                  MinecraftClient mc = MinecraftClient.getInstance();
+                  if (idx >= 0 && idx < Config.get().list.size()) {
+                      Config.Waypoint o = Config.get().list.get(idx);
+                      w.name = o.name;
+                      w.dim = o.dim;
+                      w.x = o.x;
+                      w.y = o.y;
+                      w.z = o.z;
+                      w.color = o.color;
+                  } else {
+                      w.name = "Waypoint " + (Config.get().list.size() + 1);
+                      // Kategori awal = tab yang sedang dibuka
+                      if (WaypointListScreen.cat < 3) {
+                          w.dim = WaypointListScreen.DIMS[WaypointListScreen.cat];
+                      } else if (mc.world != null) {
+                          w.dim = mc.world.getRegistryKey().getValue().toString();
+                      }
+                      if (mc.player != null) {
+                          w.x = mc.player.getBlockX();
+                          w.y = mc.player.getBlockY();
+                          w.z = mc.player.getBlockZ();
+                      }
+                  }
+              }
+
+              private static int num(String s, int def) {
+                  try {
+                      return Integer.parseInt(s.trim());
+                  } catch (Exception e) {
+                      return def;
+                  }
+              }
+
+              private Text catText() {
+                  return Text.literal("Kategori: " + WaypointListScreen.NAMES[WaypointListScreen.catOf(w.dim)]);
+              }
+
+              @Override
+              protected void build() {
+                  int x = px + 14;
+                  label("Nama", x, py + 34);
+                  nameF = new TextFieldWidget(this.textRenderer, x, py + 44, 220, 18, Text.literal("Nama"));
+                  nameF.setMaxLength(24);
+                  nameF.setText(w.name);
+                  addDrawableChild(nameF);
+
+                  label("X", x, py + 68);
+                  label("Y", x + 66, py + 68);
+                  label("Z", x + 132, py + 68);
+                  xF = new TextFieldWidget(this.textRenderer, x, py + 78, 58, 16, Text.literal("X"));
+                  yF = new TextFieldWidget(this.textRenderer, x + 66, py + 78, 58, 16, Text.literal("Y"));
+                  zF = new TextFieldWidget(this.textRenderer, x + 132, py + 78, 58, 16, Text.literal("Z"));
+                  xF.setText(String.valueOf(w.x));
+                  yF.setText(String.valueOf(w.y));
+                  zF.setText(String.valueOf(w.z));
+                  addDrawableChild(xF);
+                  addDrawableChild(yF);
+                  addDrawableChild(zF);
+
+                  colorRow(py + 102, "Warna", () -> w.color, v -> w.color = v);
+
+                  addDrawableChild(ButtonWidget.builder(catText(), b -> {
+                      int c = WaypointListScreen.catOf(w.dim);
+                      w.dim = WaypointListScreen.DIMS[c >= 3 ? 0 : (c + 1) % 3];
+                      b.setMessage(catText());
+                  }).dimensions(x, py + 136, 200, 18).build());
+
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Simpan"), b -> save())
+                          .dimensions(x, py + 160, 100, 20).build());
+                  addDrawableChild(ButtonWidget.builder(Text.literal("Batal"), b -> this.client.setScreen(parent))
+                          .dimensions(x + 108, py + 160, 100, 20).build());
+              }
+
+              private void save() {
+                  String n = nameF.getText().trim();
+                  if (n.isEmpty()) n = "Waypoint";
+                  w.name = n;
+                  w.x = num(xF.getText(), w.x);
+                  w.y = num(yF.getText(), w.y);
+                  w.z = num(zF.getText(), w.z);
+                  if (idx < 0 || idx >= Config.get().list.size()) Config.get().list.add(w);
+                  else Config.get().list.set(idx, w);
+                  Config.save();
+                  WaypointListScreen.cat = Math.min(WaypointListScreen.catOf(w.dim), 3);
+                  this.client.setScreen(parent);
+              }
+          }
+          EOF
+
+      - name: Build
+        working-directory: mod
+        run: gradle build --no-daemon
+
+      - name: Upload mod jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: clientutils-1.21.11
+          path: |
+            mod/build/libs/*.jar
+            !mod/build/libs/*-sources.jar
